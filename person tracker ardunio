@@ -1,0 +1,179 @@
+/*
+  One-axis velocity controller. Use with the matching person_tracker.py.
+  STEP = 2, DIR = 3, serial = 115200 baud.
+
+  Protocol (ASCII, newline terminated):
+    H          stop immediately, reply "HELLO TRACKER_V1"
+    V -500     request -500 STEP pulses/second (signed integer)
+    V 0        decelerate to a stop
+    S          stop STEP pulses immediately; driver remains energized
+
+  AccelStepper::runSpeed() does NOT accelerate automatically.
+  This sketch supplies its own acceleration/deceleration ramp.
+*/
+
+#include <AccelStepper.h>
+#include <math.h>
+#include <string.h>
+
+const uint8_t STEP_PIN = 2;
+const uint8_t DIR_PIN = 3;
+const long MAX_SPEED = 2000;            // STEP pulses/second, host default = 1200
+const float ACCELERATION = 4000.0f;    // STEP pulses/second^2
+const float DECELERATION = 6000.0f;
+const unsigned long COMMAND_TIMEOUT_MS = 300;
+const unsigned long RAMP_INTERVAL_US = 2000;
+
+// Keep unlimited travel from your latest version. If your cables or mount
+// need limits, enable these AFTER setting calibrated pulse counts.
+// Zero is wherever the motor is at board reset, not a measured home position.
+const bool USE_SOFT_LIMITS = false;
+const long MIN_POSITION = -2000;
+const long MAX_POSITION = 2000;
+const float LIMIT_MARGIN = 5.0f;
+
+AccelStepper motor(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+float requestedSpeed = 0.0f;
+float currentSpeed = 0.0f;
+unsigned long lastCommandMs = 0;
+unsigned long lastRampUs = 0;
+char input[24];
+uint8_t inputLength = 0;
+bool discardLine = false;
+
+void hardStop() {
+  requestedSpeed = 0.0f;
+  currentSpeed = 0.0f;
+  motor.setSpeed(0.0f);
+}
+
+void serviceMotor() {
+  // Enforce pulse-count limits before every possible step, including while
+  // parsing serial data. These are not substitutes for homing/limit switches.
+  if (USE_SOFT_LIMITS) {
+    long position = motor.currentPosition();
+    if ((position >= MAX_POSITION && currentSpeed > 0.0f) ||
+        (position <= MIN_POSITION && currentSpeed < 0.0f)) {
+      currentSpeed = 0.0f;
+      motor.setSpeed(0.0f);
+    }
+  }
+  motor.runSpeed();
+}
+
+bool parseVelocity(const char *line, long &value) {
+  if (line[0] != 'V' || line[1] != ' ') return false;
+  const char *p = line + 2;
+  bool negative = false;
+  if (*p == '-' || *p == '+') {
+    negative = (*p == '-');
+    ++p;
+  }
+  if (*p < '0' || *p > '9') return false;
+  long magnitude = 0;
+  while (*p) {
+    if (*p < '0' || *p > '9') return false;
+    // Bound BEFORE multiplication, even for malicious/garbled long input.
+    long digit = *p - '0';
+    if (magnitude > (MAX_SPEED - digit) / 10) return false;
+    magnitude = magnitude * 10 + digit;
+    ++p;
+  }
+  if (magnitude > MAX_SPEED) return false;
+  value = negative ? -magnitude : magnitude;
+  return true;
+}
+
+void processLine() {
+  input[inputLength] = '\0';
+  if (strcmp(input, "H") == 0) {
+    hardStop();
+    Serial.println(F("HELLO TRACKER_V1"));
+  } else if (strcmp(input, "S") == 0) {
+    hardStop();
+  } else {
+    long velocity;
+    if (parseVelocity(input, velocity)) {
+      requestedSpeed = (float)velocity;
+      lastCommandMs = millis();
+    } else {
+      hardStop(); // malformed commands never become unintended positions
+    }
+  }
+}
+
+void readCommands() {
+  // Bounded parsing prevents serial traffic from starving step generation.
+  uint8_t budget = 16;
+  while (budget-- && Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      if (!discardLine && inputLength > 0) processLine();
+      inputLength = 0;
+      discardLine = false;
+    } else if (c == '\r') {
+      // Accept CRLF, as used by some serial terminals.
+    } else if (!discardLine) {
+      if (c < 32 || c > 126 || inputLength >= sizeof(input) - 1) {
+        // Discard the ENTIRE line. Never accept a valid-looking suffix.
+        discardLine = true;
+        inputLength = 0;
+        hardStop();
+      } else {
+        input[inputLength++] = c;
+      }
+    }
+    serviceMotor();
+  }
+}
+
+void updateSpeed() {
+  unsigned long nowUs = micros();
+  unsigned long elapsedUs = nowUs - lastRampUs;
+  if (elapsedUs < RAMP_INTERVAL_US) return;
+  lastRampUs = nowUs;
+  // Avoid a sudden large acceleration jump if the loop was delayed.
+  float dt = (elapsedUs > 10000UL ? 10000UL : elapsedUs) * 0.000001f;
+  float target = requestedSpeed;
+  if ((unsigned long)(millis() - lastCommandMs) >= COMMAND_TIMEOUT_MS) {
+    target = 0.0f;
+    requestedSpeed = 0.0f;
+  }
+
+  if (USE_SOFT_LIMITS && target != 0.0f) {
+    long position = motor.currentPosition();
+    float remaining = target > 0.0f ? MAX_POSITION - position : position - MIN_POSITION;
+    remaining -= LIMIT_MARGIN;
+    float permitted = remaining > 0.0f ? sqrtf(2.0f * DECELERATION * remaining) : 0.0f;
+    if (fabsf(target) > permitted) target = target > 0.0f ? permitted : -permitted;
+  }
+
+  // Brake to zero before accelerating in the opposite direction.
+  if ((currentSpeed > 0.0f && target < 0.0f) ||
+      (currentSpeed < 0.0f && target > 0.0f)) target = 0.0f;
+  float rate = fabsf(target) < fabsf(currentSpeed) ? DECELERATION : ACCELERATION;
+  float maxChange = rate * dt;
+  float difference = target - currentSpeed;
+  if (difference > maxChange) difference = maxChange;
+  if (difference < -maxChange) difference = -maxChange;
+  currentSpeed += difference;
+  motor.setSpeed(currentSpeed);
+}
+
+void setup() {
+  Serial.begin(115200);
+  motor.setMaxSpeed((float)MAX_SPEED);
+  motor.setMinPulseWidth(5); // retain your original driver pulse width
+  motor.setCurrentPosition(0);
+  motor.setSpeed(0.0f);
+  lastCommandMs = millis();
+  lastRampUs = micros();
+  Serial.println(F("READY TRACKER_V1"));
+}
+
+void loop() {
+  serviceMotor();
+  readCommands();
+  updateSpeed();
+  serviceMotor();
+}
