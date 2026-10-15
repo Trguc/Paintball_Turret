@@ -1,0 +1,419 @@
+"""One-axis person tracker. Upload the matching Arduino sketch before use.
+
+Run: python person_tracker.py
+Test vision only: python person_tracker.py --no-motor
+Q/Esc: quit; Space: pause/resume; R: release target and select again.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import math
+import platform
+import threading
+import time
+
+
+# Your existing connection and model settings.
+COM_PORT = "COM7"
+CAMERA_NUMBER = 0
+BAUD_RATE = 115200
+MODEL_PATH = "yolov8n.pt"
+
+# Speeds are STEP pulses/second, including your driver's microstepping.
+MAX_SPEED = 1200
+PROPORTIONAL_GAIN = 1600.0  # pulses/s per normalized horizontal error
+MOTOR_DIRECTION = 1        # change to -1, or use --reverse, if it turns away
+STOP_BAND = 0.04           # fraction of HALF the image width (~13 px at 640)
+START_BAND = 0.07          # larger threshold prevents repeated start/stop
+SMOOTHING_SECONDS = 0.08   # time-based smoothing, independent of frame rate
+
+DETECTION_CONFIDENCE = 0.15  # low detections help ByteTrack associate tracks
+TARGET_CONFIDENCE = 0.45    # only reliable, observed boxes can command motion
+TARGET_MEMORY_SECONDS = 0.8 # remember a lost ID, but stop during the gap
+MAX_FRAME_AGE_SECONDS = 0.35 # includes inference time, measured since read()
+COMMAND_PERIOD_SECONDS = 0.04
+FIRMWARE_MAX_SPEED = 2000    # must match the sketch's MAX_SPEED
+
+
+@dataclass(frozen=True)
+class Person:
+    track_id: int
+    xyxy: tuple[float, float, float, float]
+    confidence: float
+
+    @property
+    def center_x(self) -> float:
+        return (self.xyxy[0] + self.xyxy[2]) / 2.0
+
+
+class TargetSelector:
+    """Keep a temporary tracking ID instead of choosing by confidence each frame."""
+
+    def __init__(self, memory_seconds: float = TARGET_MEMORY_SECONDS):
+        self.memory_seconds = memory_seconds
+        self.reset()
+
+    def reset(self):
+        self.target_id = None
+        self.last_seen = -math.inf
+
+    def select(self, people: list[Person], width: int, now: float):
+        eligible = [p for p in people if p.confidence >= TARGET_CONFIDENCE]
+        if self.target_id is not None:
+            for person in eligible:
+                if person.track_id == self.target_id:
+                    self.last_seen = now
+                    return person
+            if now - self.last_seen < self.memory_seconds:
+                return None  # do not move using a predicted or missing box
+            self.reset()
+        if not eligible:
+            return None
+        # First acquisition: prefer the person nearest the horizontal center.
+        person = min(eligible, key=lambda p: (abs(p.center_x - width / 2), -p.confidence))
+        self.target_id = person.track_id
+        self.last_seen = now
+        return person
+
+
+class SpeedController:
+    """Proportional visual control; Arduino applies the acceleration limits."""
+
+    def __init__(self, gain=PROPORTIONAL_GAIN, max_speed=MAX_SPEED, direction=MOTOR_DIRECTION):
+        self.gain, self.max_speed, self.direction = gain, max_speed, direction
+        self.reset()
+
+    def reset(self):
+        self.filtered_error = 0.0
+        self.last_sample_time = None
+        self.moving = False
+
+    def update(self, error: float, sample_time: float) -> int:
+        if not math.isfinite(error) or not math.isfinite(sample_time):
+            self.reset()
+            return 0
+        error = max(-1.0, min(1.0, error))
+        # A new observation inside the stop band must not keep a stale turn alive.
+        if abs(error) <= STOP_BAND:
+            self.filtered_error = error
+            self.last_sample_time = sample_time
+            self.moving = False
+            return 0
+        if self.last_sample_time is None or error * self.filtered_error < 0:
+            self.filtered_error = error
+        else:
+            dt = max(0.0, sample_time - self.last_sample_time)
+            alpha = 1.0 - math.exp(-dt / SMOOTHING_SECONDS)
+            self.filtered_error += alpha * (error - self.filtered_error)
+        self.last_sample_time = sample_time
+        if not self.moving:
+            if abs(error) < START_BAND:
+                return 0
+            self.moving = True
+        magnitude = self.gain * max(0.0, abs(self.filtered_error) - STOP_BAND)
+        speed = math.copysign(min(self.max_speed, magnitude), self.filtered_error)
+        return round(self.direction * speed)
+
+
+def fresh_speed(speed: int, observed_at: float, now: float) -> int:
+    """A heartbeat must not keep an obsolete vision command moving the motor."""
+    age = now - observed_at
+    return speed if 0 <= age <= MAX_FRAME_AGE_SECONDS else 0
+
+
+class LatestCamera:
+    """One capture owner, one replaceable frame; inference never builds a queue."""
+
+    def __init__(self, cv2, index: int):
+        self.cv2 = cv2
+        self.condition = threading.Condition()
+        self.stop_event = threading.Event()
+        self.frame = None
+        self.sequence = 0
+        self.received_at = 0.0
+        self.error = None
+        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
+        self.capture = cv2.VideoCapture(index, backend)
+        if not self.capture.isOpened() and backend != cv2.CAP_ANY:
+            self.capture.release()
+            self.capture = cv2.VideoCapture(index)
+        if not self.capture.isOpened():
+            self.capture.release()
+            raise RuntimeError(f"Cannot open camera {index}. Try --camera 0.")
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.capture.set(cv2.CAP_PROP_FPS, 30)
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # backend may ignore this
+        self.thread = threading.Thread(target=self._run, name="camera", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            while not self.stop_event.is_set():
+                ok, frame = self.capture.read()
+                received_at = time.monotonic()
+                if not ok or frame is None:
+                    raise RuntimeError("Camera stopped supplying frames.")
+                with self.condition:
+                    self.frame = frame
+                    self.received_at = received_at
+                    self.sequence += 1
+                    self.condition.notify_all()
+        except Exception as exc:
+            with self.condition:
+                self.error = str(exc)
+                self.condition.notify_all()
+        finally:
+            # Only this thread touches capture after startup.
+            self.capture.release()
+
+    def latest(self, after_sequence: int):
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.sequence != after_sequence or self.error is not None,
+                timeout=0.03,
+            )
+            if self.error:
+                raise RuntimeError(self.error)
+            if self.frame is None or self.sequence == after_sequence:
+                return None
+            return self.sequence, self.received_at, self.frame.copy()
+
+    def close(self):
+        self.stop_event.set()
+        # Some drivers block in read(); never race release() against that call.
+        self.thread.join(timeout=1.0)
+
+
+class MotorLink:
+    """Own the serial port in one worker; send fresh speed or zero at 25 Hz."""
+
+    def __init__(self, port: str):
+        import serial
+
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.speed = 0
+        self.observed_at = -math.inf
+        self.last_sent_speed = 0
+        self.error = None
+        self.port = serial.Serial(port, BAUD_RATE, timeout=0.1, write_timeout=0.05)
+        try:
+            # Opening the port resets many Arduino boards. H is also a stop command.
+            time.sleep(2.0)
+            self.port.reset_input_buffer()
+            self._write(b"H\n")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if self.port.readline().strip() == b"HELLO TRACKER_V1":
+                    break
+            else:
+                raise RuntimeError("Arduino handshake failed. Upload person_tracker_arduino.ino first.")
+            self.port.timeout = 0
+        except BaseException:
+            self.port.close()
+            raise
+        self.thread = threading.Thread(target=self._run, name="motor-link", daemon=True)
+        self.thread.start()
+
+    def _write(self, message: bytes):
+        if self.port.write(message) != len(message):
+            raise RuntimeError("Incomplete serial write.")
+
+    def command(self, speed: int, observed_at: float):
+        with self.lock:
+            self.speed = max(-FIRMWARE_MAX_SPEED, min(FIRMWARE_MAX_SPEED, int(speed)))
+            self.observed_at = observed_at
+
+    def _run(self):
+        incoming = bytearray()
+        try:
+            while not self.stop_event.is_set():
+                incoming.extend(self.port.read(min(self.port.in_waiting, 256)))
+                while b"\n" in incoming:
+                    line, _, remainder = incoming.partition(b"\n")
+                    incoming = bytearray(remainder)
+                    if line.strip() == b"READY TRACKER_V1":
+                        raise RuntimeError("Arduino reset during tracking. Restart the program.")
+                if len(incoming) > 512:
+                    raise RuntimeError("Unexpected serial data from Arduino.")
+                with self.lock:
+                    speed = fresh_speed(self.speed, self.observed_at, time.monotonic())
+                self._write(f"V {speed}\n".encode("ascii"))
+                self.last_sent_speed = speed
+                self.stop_event.wait(COMMAND_PERIOD_SECONDS)
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            try:
+                self._write(b"S\n")  # stop pulses immediately on exit
+            except Exception:
+                pass  # firmware watchdog handles a disconnected serial link
+            self.port.close()
+
+    def close(self):
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+
+
+def tracked_people(result) -> list[Person]:
+    boxes = result.boxes
+    if boxes is None or boxes.id is None:
+        return []
+    # Move the whole result to CPU once, rather than synchronizing per box.
+    boxes = boxes.cpu()
+    return [
+        Person(int(track_id), tuple(map(float, coords)), float(confidence))
+        for coords, track_id, confidence in zip(
+            boxes.xyxy.tolist(), boxes.id.tolist(), boxes.conf.tolist()
+        )
+    ]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", default=COM_PORT)
+    parser.add_argument("--camera", type=int, default=CAMERA_NUMBER)
+    parser.add_argument("--model", default=MODEL_PATH)
+    parser.add_argument("--imgsz", type=int, default=416)
+    parser.add_argument("--device", default=None, help="e.g. cpu, 0 (CUDA GPU), or mps")
+    parser.add_argument("--max-speed", type=int, default=MAX_SPEED)
+    parser.add_argument("--gain", type=float, default=PROPORTIONAL_GAIN)
+    parser.add_argument("--reverse", action="store_true")
+    parser.add_argument("--no-motor", action="store_true", help="Run camera/tracker without serial.")
+    args = parser.parse_args(argv)
+    if not 1 <= args.max_speed <= FIRMWARE_MAX_SPEED:
+        parser.error(f"--max-speed must be 1..{FIRMWARE_MAX_SPEED}")
+    if not math.isfinite(args.gain) or args.gain <= 0:
+        parser.error("--gain must be finite and positive")
+    if args.imgsz < 32 or args.imgsz % 32:
+        parser.error("--imgsz must be a positive multiple of 32, such as 320 or 416")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        import cv2
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise SystemExit(f"Missing dependency: {exc}. Run: python -m pip install -r requirements.txt")
+
+    camera = motor = None
+    window = "Person Tracker | Space: pause | R: reselect | Q: quit"
+    direction = MOTOR_DIRECTION * (-1 if args.reverse else 1)
+    controller = SpeedController(args.gain, args.max_speed, direction)
+    selector = TargetSelector()
+    paused = False
+    sequence = 0
+    fps = 0.0
+    last_display_time = None
+    status = "Starting"
+    last_frame_time = time.monotonic()
+    try:
+        print(f"Loading {args.model}...")
+        model = YOLO(args.model)
+        if not args.no_motor:
+            print(f"Connecting to {args.port} (close Arduino Serial Monitor)...")
+            motor = MotorLink(args.port)
+        camera = LatestCamera(cv2, args.camera)
+        last_frame_time = time.monotonic()
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        print("Tracking started. Q/Esc: quit. Space: pause. R: select a new target.")
+        if args.no_motor:
+            print("Vision-only mode: no motor commands will be sent.")
+        while True:
+            if motor and motor.error:
+                raise RuntimeError(f"Arduino communication: {motor.error}")
+            item = camera.latest(sequence)
+            if item is not None:
+                sequence, observed_at, frame = item
+                last_frame_time = time.monotonic()
+                height, width = frame.shape[:2]
+                person = None
+                requested_speed = 0
+                if paused:
+                    controller.reset()
+                    status = "Paused"
+                else:
+                    result = model.track(
+                        frame, persist=True, tracker="bytetrack.yaml", classes=[0],
+                        conf=DETECTION_CONFIDENCE, imgsz=args.imgsz,
+                        device=args.device, verbose=False, max_det=30,
+                    )[0]
+                    now = time.monotonic()
+                    if now - observed_at > MAX_FRAME_AGE_SECONDS:
+                        controller.reset()
+                        status = "Frame too old: stopped (try --imgsz 320)"
+                    else:
+                        person = selector.select(tracked_people(result), width, now)
+                        if person is None:
+                            controller.reset()
+                            status = "Target lost: stopped" if selector.target_id is not None else "No target"
+                        else:
+                            error = (person.center_x - width / 2.0) / (width / 2.0)
+                            requested_speed = controller.update(error, observed_at)
+                            status = f"Tracking ID {person.track_id}" if requested_speed else "Centered"
+                if motor:
+                    motor.command(requested_speed, observed_at)
+                if person:
+                    x1, y1, x2, y2 = map(int, person.xyxy)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(frame, (int(person.center_x), (y1 + y2) // 2), 5, (255, 100, 0), -1)
+                    cv2.putText(frame, f"ID {person.track_id} | {person.confidence:.2f}",
+                                (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                cx, cy = width // 2, height // 2
+                cv2.drawMarker(frame, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 22, 2)
+                for sign in (-1, 1):
+                    x = round(cx + sign * STOP_BAND * width / 2)
+                    cv2.line(frame, (x, 0), (x, height), (80, 80, 80), 1)
+                now = time.monotonic()
+                if last_display_time is not None:
+                    current_fps = 1.0 / max(1e-6, now - last_display_time)
+                    fps = current_fps if not fps else 0.8 * fps + 0.2 * current_fps
+                last_display_time = now
+                lines = [
+                    status,
+                    f"Requested: {requested_speed:+d} pulses/s | FPS: {fps:.1f}",
+                    f"Frame age: {(now - observed_at) * 1000:.0f} ms" +
+                    (" | MOTOR DISABLED" if args.no_motor else ""),
+                ]
+                for i, line in enumerate(lines):
+                    cv2.putText(frame, line, (12, 26 + i * 26), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.56, (0, 255, 255), 2)
+                cv2.imshow(window, frame)
+            elif time.monotonic() - last_frame_time > 2.0:
+                raise RuntimeError("No new camera frames for 2 seconds.")
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            if key == ord(" "):
+                paused = not paused
+                selector.reset()
+                controller.reset()
+                if motor:
+                    motor.command(0, time.monotonic())
+            elif key == ord("r"):
+                selector.reset()
+                controller.reset()
+                if motor:
+                    motor.command(0, time.monotonic())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Stop the motor before waiting on a potentially blocked camera driver.
+        if motor:
+            motor.close()
+        if camera:
+            camera.close()
+        cv2.destroyAllWindows()
+        print("Tracker stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        raise SystemExit(f"Error: {exc}") from exc
